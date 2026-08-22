@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+*.sqlite3
+quick_validation_report.json
+sample_ticks.csv
+.git/
