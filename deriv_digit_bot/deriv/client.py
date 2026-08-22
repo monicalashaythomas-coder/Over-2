@@ -1,0 +1,214 @@
+"""
+Deriv WebSocket client.
+
+Uses the Options API OTP bootstrap (REST -> OTP -> WS URL), falling
+back to direct v3 connect for tokens not yet migrated. Message
+payloads use the corrected schema learned the hard way earlier in
+this project: `proposal` uses `underlying_symbol` (not `symbol`), and
+`active_symbols` does not accept `product_type`.
+
+This client is intentionally straightforward (connect, send, receive
+by matching req_id) rather than a fully hardened production
+supervisor - reconnect-on-drop is implemented, but this has not been
+soak-tested against live market conditions. Treat DERIV_DEMO/LIVE use
+as something to watch closely, not "fire and forget."
+"""
+from __future__ import annotations
+
+import asyncio
+import itertools
+import json
+from typing import Any, Dict, Optional
+
+import websockets
+
+try:
+    import httpx
+except ImportError:
+    httpx = None
+
+REST_BASE = "https://api.deriv.com"
+WS_BASE = "wss://ws.derivws.com/websockets/v3"
+
+
+class DerivClient:
+    def __init__(self, app_id: str, token: str, want_virtual: Optional[bool] = None,
+                 forced_account_id: Optional[str] = None):
+        """
+        want_virtual: True to require a demo/virtual account, False to
+        require a real-money account, None to accept whichever comes
+        back first (only appropriate for HISTORICAL_SIMULATION, which
+        never calls connect() at all). main.py passes this explicitly
+        based on cfg.mode so DERIV_DEMO can never silently land on a
+        real-money account or vice versa.
+        forced_account_id: if set (DERIV_ACCOUNT_ID env var), skips
+        auto-selection entirely and requires exactly this account id
+        to be present - use this if you have multiple accounts of the
+        same type and auto-selection's "first match" isn't the one
+        you want.
+        """
+        self.app_id = app_id
+        self.token = token
+        self.want_virtual = want_virtual
+        self.forced_account_id = forced_account_id or None
+        self.resolved_account: Optional[Dict[str, Any]] = None
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._req_id_counter = itertools.count(1)
+        self._pending: Dict[int, asyncio.Future] = {}
+        self._recv_task: Optional[asyncio.Task] = None
+        self._subscribers: Dict[str, list] = {}  # msg_type -> list of async callbacks
+
+    async def connect(self) -> None:
+        url = await self._resolve_ws_url()
+        self._ws = await websockets.connect(url, ping_interval=20, ping_timeout=10)
+        self._recv_task = asyncio.create_task(self._recv_loop())
+        if "authorize" not in url:
+            # Legacy fallback path still needs an explicit authorize call
+            await self._send({"authorize": self.token})
+
+    def _is_virtual(self, account: Dict[str, Any]) -> Optional[bool]:
+        """Deriv account objects use is_virtual (bool/0-1) in most
+        responses; some variants use account_type == 'demo'/'real'.
+        Returns None if neither field is present (caller should treat
+        that account as ambiguous, not assume it matches)."""
+        if "is_virtual" in account:
+            return bool(account["is_virtual"])
+        if "account_type" in account:
+            return str(account["account_type"]).lower() in ("demo", "virtual")
+        return None
+
+    def _select_account(self, accounts: list) -> Optional[Dict[str, Any]]:
+        if not accounts:
+            return None
+
+        if self.forced_account_id:
+            for a in accounts:
+                if str(a.get("id")) == str(self.forced_account_id):
+                    return a
+            return None  # explicit id requested but not found - do not fall back
+
+        if self.want_virtual is None:
+            return accounts[0]
+
+        matching = [a for a in accounts if self._is_virtual(a) == self.want_virtual]
+        if matching:
+            if len(matching) > 1:
+                # multiple matching accounts (e.g. several real-money
+                # currencies) - take the first but make this visible
+                # rather than silently guessing which one matters.
+                print(f"WARNING: {len(matching)} accounts match "
+                      f"{'demo' if self.want_virtual else 'real-money'} - using "
+                      f"{matching[0].get('id')} ({matching[0].get('currency', '?')}). "
+                      f"Set DERIV_ACCOUNT_ID explicitly if this is wrong.")
+            return matching[0]
+
+        # Nothing matched the requested type - do NOT silently fall back
+        # to a wrong-type account (that would mean DERIV_DEMO could pick
+        # a real-money account, or vice versa).
+        return None
+
+    async def _resolve_ws_url(self) -> str:
+        if httpx is None or not self.token:
+            return f"{WS_BASE}?app_id={self.app_id}"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                headers = {"Authorization": f"Bearer {self.token}"}
+                accounts_resp = await client.get(f"{REST_BASE}/trading/v1/options/accounts", headers=headers)
+                if accounts_resp.status_code == 404:
+                    return f"{WS_BASE}?app_id={self.app_id}"
+                accounts_resp.raise_for_status()
+                accounts = accounts_resp.json().get("accounts", [])
+                if not accounts:
+                    return f"{WS_BASE}?app_id={self.app_id}"
+
+                account = self._select_account(accounts)
+                if account is None:
+                    if self.forced_account_id:
+                        raise RuntimeError(
+                            f"DERIV_ACCOUNT_ID={self.forced_account_id} was not found among "
+                            f"{len(accounts)} account(s) returned by Deriv for this token."
+                        )
+                    kind = "demo/virtual" if self.want_virtual else "real-money"
+                    raise RuntimeError(
+                        f"No {kind} account found for this token among {len(accounts)} "
+                        f"account(s) returned by Deriv. Refusing to guess - check DERIV_TOKEN "
+                        f"and your account setup on Deriv, or set DERIV_ACCOUNT_ID explicitly."
+                    )
+                self.resolved_account = account
+                account_id = account["id"]
+                print(f"Resolved Deriv account: id={account_id} "
+                      f"currency={account.get('currency', '?')} "
+                      f"virtual={self._is_virtual(account)}")
+
+                otp_resp = await client.post(
+                    f"{REST_BASE}/trading/v1/options/accounts/{account_id}/otp", headers=headers
+                )
+                otp_resp.raise_for_status()
+                return otp_resp.json()["websocket_url"]
+        except RuntimeError:
+            raise  # account-mismatch is a real error - never swallow it into a silent fallback
+        except Exception:
+            # Any OTHER failure in the new-API bootstrap (network hiccup,
+            # endpoint not migrated yet, etc.) falls back to the legacy
+            # direct-connect path rather than crashing startup.
+            return f"{WS_BASE}?app_id={self.app_id}"
+
+    async def _recv_loop(self) -> None:
+        try:
+            async for raw in self._ws:
+                msg = json.loads(raw)
+                req_id = msg.get("req_id")
+                if req_id is not None and req_id in self._pending:
+                    fut = self._pending.pop(req_id)
+                    if not fut.done():
+                        fut.set_result(msg)
+                msg_type = msg.get("msg_type")
+                for cb in self._subscribers.get(msg_type, []):
+                    asyncio.create_task(cb(msg))
+        except websockets.ConnectionClosed:
+            pass
+
+    async def _send(self, payload: Dict[str, Any], expect_response: bool = True) -> Optional[Dict[str, Any]]:
+        req_id = next(self._req_id_counter)
+        payload = {**payload, "req_id": req_id}
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        if expect_response:
+            self._pending[req_id] = fut
+        await self._ws.send(json.dumps(payload))
+        if expect_response:
+            return await asyncio.wait_for(fut, timeout=15)
+        return None
+
+    def subscribe(self, msg_type: str, callback) -> None:
+        self._subscribers.setdefault(msg_type, []).append(callback)
+
+    async def subscribe_ticks(self, symbol: str) -> None:
+        await self._send({"ticks": symbol, "subscribe": 1})
+
+    async def get_active_symbols(self) -> Dict[str, Any]:
+        return await self._send({"active_symbols": "brief"})
+
+    async def get_proposal(self, contract_type: str, symbol: str, amount: float, duration: int,
+                            duration_unit: str, currency: str = "USD") -> Dict[str, Any]:
+        return await self._send({
+            "proposal": 1,
+            "amount": amount,
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": currency,
+            "duration": duration,
+            "duration_unit": duration_unit,
+            "underlying_symbol": symbol,
+        })
+
+    async def buy(self, proposal_id: str, price: float) -> Dict[str, Any]:
+        return await self._send({"buy": proposal_id, "price": price})
+
+    async def get_contract_status(self, contract_id: str) -> Dict[str, Any]:
+        return await self._send({"proposal_open_contract": 1, "contract_id": contract_id, "subscribe": 0})
+
+    async def close(self) -> None:
+        if self._recv_task:
+            self._recv_task.cancel()
+        if self._ws:
+            await self._ws.close()
