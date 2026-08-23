@@ -64,15 +64,17 @@ class DerivClient:
         try:
             self._ws = await websockets.connect(url, ping_interval=20, ping_timeout=10)
         except websockets.InvalidStatus as e:
-            if is_legacy and getattr(e.response, "status_code", None) == 401:
+            status = getattr(e.response, "status_code", None)
+            if is_legacy and status == 401:
                 raise RuntimeError(
-                    "Legacy WebSocket connect was rejected with HTTP 401. This specific "
-                    "combination (legacy URL + 401 at handshake) means your account has "
-                    "been migrated to Deriv's Options API and no longer accepts direct "
-                    "connects - it needs the OTP bootstrap. If you're seeing this, the "
-                    "OTP flow in _resolve_ws_url() fell back to legacy - check the WARNING "
-                    "printed just before this error for why, or verify DERIV_TOKEN/"
-                    "DERIV_APP_ID are set correctly in Railway."
+                    f"Legacy WebSocket connect was rejected with HTTP {status}. "
+                    "This does NOT necessarily mean the account is migrated - it can equally "
+                    "mean DERIV_APP_ID is invalid, unregistered, or still the default '1089' "
+                    "(Deriv's public test ID, meant for unauthenticated calls only - not valid "
+                    "for authorize/account-specific calls). Check DERIV_APP_ID is your own "
+                    "registered app ID before assuming this is a migration issue. Also check "
+                    "the WARNING printed just before this error (if any) for why the OTP "
+                    "bootstrap fell back to legacy in the first place."
                 ) from e
             raise
         self._recv_task = asyncio.create_task(self._recv_loop())
@@ -149,8 +151,15 @@ class DerivClient:
                     return f"{WS_BASE}?app_id={self.app_id}"
 
                 if accounts_resp.status_code == 404:
-                    # This specific status means the Options API doesn't know
-                    # this token at all - genuinely not-yet-migrated, legacy is correct.
+                    # Could genuinely mean "no Options accounts for this token"
+                    # (real accounts, not enrolled in this product) - but could
+                    # also mean a bad app_id/path. Print it either way instead
+                    # of silently falling back, since that silence is exactly
+                    # what makes this hard to diagnose from logs alone.
+                    print(f"WARNING: GET {REST_BASE}/trading/v1/options/accounts returned 404 - "
+                          f"falling back to legacy direct connect. If legacy also fails, check "
+                          f"DERIV_APP_ID is a real registered app ID, not left as the default "
+                          f"test value.")
                     return f"{WS_BASE}?app_id={self.app_id}"
 
                 if accounts_resp.status_code in (401, 403):
