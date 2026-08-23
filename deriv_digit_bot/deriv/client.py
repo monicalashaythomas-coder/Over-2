@@ -27,7 +27,7 @@ try:
 except ImportError:
     httpx = None
 
-REST_BASE = "https://api.deriv.com"
+REST_BASE = "https://api.derivws.com"
 WS_BASE = "wss://ws.derivws.com/websockets/v3"
 
 
@@ -134,7 +134,10 @@ class DerivClient:
 
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                headers = {"Authorization": f"Bearer {self.token}"}
+                headers = {
+                    "Authorization": f"Bearer {self.token}",
+                    "Deriv-App-ID": self.app_id,  # required by both endpoints per Deriv docs - was missing entirely
+                }
                 try:
                     accounts_resp = await client.get(f"{REST_BASE}/trading/v1/options/accounts", headers=headers)
                 except httpx.RequestError as e:
@@ -159,7 +162,15 @@ class DerivClient:
                     )
 
                 accounts_resp.raise_for_status()  # any other non-2xx is a real, surfaced error
-                accounts = accounts_resp.json().get("accounts", [])
+                accounts_body = accounts_resp.json()
+                # Defensive: Deriv's OTP endpoint wraps its payload in a
+                # top-level "data" key, so the accounts list plausibly does
+                # too even though the docs page doesn't show a response
+                # example. Handle both shapes rather than assume either.
+                if "data" in accounts_body and isinstance(accounts_body["data"], dict):
+                    accounts = accounts_body["data"].get("accounts", [])
+                else:
+                    accounts = accounts_body.get("accounts", [])
                 if not accounts:
                     return f"{WS_BASE}?app_id={self.app_id}"
 
@@ -191,7 +202,18 @@ class DerivClient:
                         f"for account {account_id}. Check DERIV_TOKEN has permission for this account."
                     )
                 otp_resp.raise_for_status()
-                return otp_resp.json()["websocket_url"]
+                otp_body = otp_resp.json()
+                # Per Deriv docs the payload is nested: {"data": {"url": "wss://..."}}
+                # - not a flat "websocket_url" key. Handle both defensively in
+                # case the API returns either shape.
+                if "data" in otp_body and isinstance(otp_body["data"], dict) and "url" in otp_body["data"]:
+                    return otp_body["data"]["url"]
+                if "websocket_url" in otp_body:
+                    return otp_body["websocket_url"]
+                raise RuntimeError(
+                    f"OTP response didn't contain a recognizable URL field. "
+                    f"Response keys: {list(otp_body.keys())}"
+                )
         except RuntimeError:
             raise  # our own diagnosed errors - never swallow these into a silent fallback
 
