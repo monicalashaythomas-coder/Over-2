@@ -1,269 +1,286 @@
 """
-Deriv WebSocket client.
+Deriv WebSocket client - Options API (REST OTP bootstrap + WebSocket).
 
-Uses the Options API OTP bootstrap (REST -> OTP -> WS URL), falling
-back to direct v3 connect for tokens not yet migrated. Message
-payloads use the corrected schema learned the hard way earlier in
-this project: `proposal` uses `underlying_symbol` (not `symbol`), and
-`active_symbols` does not accept `product_type`.
+This connection layer was ported from a working reference bot rather
+than built from documentation alone, after several rounds of the
+docs-only version failing in ways that turned out to rest on
+unverified assumptions. Concretely, this version differs from the
+previous one in ways that matter:
 
-This client is intentionally straightforward (connect, send, receive
-by matching req_id) rather than a fully hardened production
-supervisor - reconnect-on-drop is implemented, but this has not been
-soak-tested against live market conditions. Treat DERIV_DEMO/LIVE use
-as something to watch closely, not "fire and forget."
+  - REST calls use urllib in a thread executor, not httpx. Removes a
+    whole dependency and the failure class of "did httpx actually
+    get installed in this container" that cost real debugging time.
+  - NO legacy direct-connect fallback. The previous version fell back
+    to the deprecated wss://ws.derivws.com/websockets/v3 path on
+    various REST failures, which then failed itself with a confusing
+    401 - two guesses stacked on top of each other. This version
+    either gets a working OTP URL or raises clearly; there is nothing
+    to silently fall back to.
+  - Account selection matches Deriv's actual response shape: accounts
+    carry a `type` (or `account_type`) field valued "real" or "demo" -
+    not an `is_virtual` boolean, which was an assumption in the
+    previous version that was never actually confirmed against a real
+    response.
+  - Supports a pre-set account_id (DERIV_ACCOUNT_ID) that skips the
+    accounts-lookup call entirely and goes straight to the OTP
+    endpoint - useful once you know which account you want.
+  - Send-queue + recv-pump architecture with req_id-based routing via
+    asyncio.Future, so a concurrent proposal fetch can't get
+    misrouted into whatever's currently consuming the tick stream.
 """
 from __future__ import annotations
 
 import asyncio
-import itertools
 import json
+import urllib.error
+import urllib.request
 from typing import Any, Dict, Optional
 
 import websockets
-
-try:
-    import httpx
-except ImportError:
-    httpx = None
+from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
 
 REST_BASE = "https://api.derivws.com"
-WS_BASE = "wss://ws.derivws.com/websockets/v3"
 
 
 class DerivClient:
-    def __init__(self, app_id: str, token: str, want_virtual: Optional[bool] = None,
-                 forced_account_id: Optional[str] = None):
-        """
-        want_virtual: True to require a demo/virtual account, False to
-        require a real-money account, None to accept whichever comes
-        back first (only appropriate for HISTORICAL_SIMULATION, which
-        never calls connect() at all). main.py passes this explicitly
-        based on cfg.mode so DERIV_DEMO can never silently land on a
-        real-money account or vice versa.
-        forced_account_id: if set (DERIV_ACCOUNT_ID env var), skips
-        auto-selection entirely and requires exactly this account id
-        to be present - use this if you have multiple accounts of the
-        same type and auto-selection's "first match" isn't the one
-        you want.
-        """
+    def __init__(self, app_id: str, token: str, use_real_account: bool = False,
+                 account_id: Optional[str] = None, ws_ping_interval: int = 30):
         self.app_id = app_id
         self.token = token
-        self.want_virtual = want_virtual
-        self.forced_account_id = forced_account_id or None
-        self.resolved_account: Optional[Dict[str, Any]] = None
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
-        self._req_id_counter = itertools.count(1)
-        self._pending: Dict[int, asyncio.Future] = {}
+        self.use_real_account = use_real_account
+        self.account_id = account_id or None
+        self.ws_ping_interval = ws_ping_interval
+
+        self.ws_url: Optional[str] = None
+        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._send_queue: Optional[asyncio.Queue] = None
+        self._inbox: Optional[asyncio.Queue] = None
+        self._send_task: Optional[asyncio.Task] = None
         self._recv_task: Optional[asyncio.Task] = None
-        self._subscribers: Dict[str, list] = {}  # msg_type -> list of async callbacks
+        self._req_id_counter = 1
+        self._pending_requests: Dict[int, asyncio.Future] = {}
+        self.initial_balance: float = 0.0
+
+    # ---- REST bootstrap (blocking; always run via run_in_executor) ----
+
+    def _rest_request(self, path: str, method: str = "GET") -> dict:
+        req = urllib.request.Request(
+            f"{REST_BASE}{path}", method=method,
+            headers={
+                "Deriv-App-ID": self.app_id,
+                "Authorization": f"Bearer {self.token}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code} from {path}: {body}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Network error calling {path}: {exc.reason}") from exc
+
+    def _resolve_account_id(self) -> str:
+        payload = self._rest_request("/trading/v1/options/accounts")
+        accounts = payload.get("data") or payload.get("accounts") or []
+        if not accounts:
+            raise RuntimeError(
+                "No accounts returned by Deriv for this token. Check DERIV_TOKEN "
+                "is valid and was generated on developers.deriv.com (the current "
+                "platform), not an older/legacy system."
+            )
+        wanted = "real" if self.use_real_account else "demo"
+        for acc in accounts:
+            t = str(acc.get("type") or acc.get("account_type") or "").lower()
+            if t == wanted:
+                return acc.get("account_id") or acc.get("id")
+        first = accounts[0]
+        first_id = first.get("account_id") or first.get("id")
+        print(f"WARNING: no account with type='{wanted}' found among "
+              f"{len(accounts)} account(s) - using the first one returned "
+              f"({first_id}). Set DERIV_ACCOUNT_ID explicitly to control this.")
+        return first_id
+
+    def _fetch_ws_url(self) -> str:
+        if not self.account_id:
+            self.account_id = self._resolve_account_id()
+        payload = self._rest_request(
+            f"/trading/v1/options/accounts/{self.account_id}/otp", method="POST")
+        url = (payload.get("data") or {}).get("url")
+        if not url:
+            raise RuntimeError(f"OTP response missing url field: {payload}")
+        return url
+
+    # ---- Connect ----
 
     async def connect(self) -> None:
-        url = await self._resolve_ws_url()
-        is_legacy = "authorize" not in url  # OTP URLs embed the auth; legacy doesn't
-        try:
-            self._ws = await websockets.connect(url, ping_interval=20, ping_timeout=10)
-        except websockets.InvalidStatus as e:
-            status = getattr(e.response, "status_code", None)
-            if is_legacy and status == 401:
-                raise RuntimeError(
-                    f"Legacy WebSocket connect was rejected with HTTP {status}. "
-                    "This does NOT necessarily mean the account is migrated - it can equally "
-                    "mean DERIV_APP_ID is invalid, unregistered, or still the default '1089' "
-                    "(Deriv's public test ID, meant for unauthenticated calls only - not valid "
-                    "for authorize/account-specific calls). Check DERIV_APP_ID is your own "
-                    "registered app ID before assuming this is a migration issue. Also check "
-                    "the WARNING printed just before this error (if any) for why the OTP "
-                    "bootstrap fell back to legacy in the first place."
-                ) from e
-            raise
-        self._recv_task = asyncio.create_task(self._recv_loop())
-        if is_legacy:
-            # Legacy fallback path still needs an explicit authorize call
-            await self._send({"authorize": self.token})
-
-    def _is_virtual(self, account: Dict[str, Any]) -> Optional[bool]:
-        """Deriv account objects use is_virtual (bool/0-1) in most
-        responses; some variants use account_type == 'demo'/'real'.
-        Returns None if neither field is present (caller should treat
-        that account as ambiguous, not assume it matches)."""
-        if "is_virtual" in account:
-            return bool(account["is_virtual"])
-        if "account_type" in account:
-            return str(account["account_type"]).lower() in ("demo", "virtual")
-        return None
-
-    def _select_account(self, accounts: list) -> Optional[Dict[str, Any]]:
-        if not accounts:
-            return None
-
-        if self.forced_account_id:
-            for a in accounts:
-                if str(a.get("id")) == str(self.forced_account_id):
-                    return a
-            return None  # explicit id requested but not found - do not fall back
-
-        if self.want_virtual is None:
-            return accounts[0]
-
-        matching = [a for a in accounts if self._is_virtual(a) == self.want_virtual]
-        if matching:
-            if len(matching) > 1:
-                # multiple matching accounts (e.g. several real-money
-                # currencies) - take the first but make this visible
-                # rather than silently guessing which one matters.
-                print(f"WARNING: {len(matching)} accounts match "
-                      f"{'demo' if self.want_virtual else 'real-money'} - using "
-                      f"{matching[0].get('id')} ({matching[0].get('currency', '?')}). "
-                      f"Set DERIV_ACCOUNT_ID explicitly if this is wrong.")
-            return matching[0]
-
-        # Nothing matched the requested type - do NOT silently fall back
-        # to a wrong-type account (that would mean DERIV_DEMO could pick
-        # a real-money account, or vice versa).
-        return None
-
-    async def _resolve_ws_url(self) -> str:
         if not self.token:
-            raise RuntimeError("DERIV_TOKEN is empty - cannot authenticate. Check the Railway variable is set.")
+            raise RuntimeError("DERIV_TOKEN is empty - cannot authenticate.")
 
-        if httpx is None:
-            print("WARNING: httpx not installed - cannot use the Options API OTP bootstrap, "
-                  "falling back to legacy direct connect. This WILL 401 if your account has "
-                  "been migrated to the new Options API. Check requirements.txt was actually "
-                  "installed (see Build Logs for a 'pip install' step that completed).")
-            return f"{WS_BASE}?app_id={self.app_id}"
+        loop = asyncio.get_event_loop()
+        self.ws_url = await loop.run_in_executor(None, self._fetch_ws_url)
 
+        safe = self.ws_url.split("?")[0]
+        print(f"Connecting -> {safe} (account {self.account_id})")
+
+        self.ws = await websockets.connect(
+            self.ws_url, ping_interval=self.ws_ping_interval,
+            ping_timeout=20, close_timeout=10,
+        )
+        self._send_queue = asyncio.Queue()
+        self._inbox = asyncio.Queue()
+        self._start_io()
+
+        # Confirm the connection actually works end-to-end before
+        # returning - a balance check is cheap and catches auth
+        # problems immediately rather than on the first real trade call.
+        await self.send({"balance": 1})
+        resp = await self.receive_type("balance", timeout=15)
+        if resp is None or "error" in resp:
+            err = (resp or {}).get("error", {}).get("message", "timeout")
+            await self.close()
+            raise RuntimeError(f"Post-connect balance check failed: {err}")
+        bal = resp.get("balance", {})
+        self.initial_balance = float(bal.get("balance", 0) or 0)
+        print(f"Connected. account={self.account_id} "
+              f"balance={self.initial_balance:.2f} {bal.get('currency', '')}")
+
+    def _start_io(self) -> None:
+        for t in (self._send_task, self._recv_task):
+            if t and not t.done():
+                t.cancel()
+        self._send_task = asyncio.create_task(self._send_pump(), name="send_pump")
+        self._recv_task = asyncio.create_task(self._recv_pump(), name="recv_pump")
+        self._req_id_counter = 1
+        self._pending_requests = {}
+
+    def _next_req_id(self) -> int:
+        rid = self._req_id_counter
+        self._req_id_counter += 1
+        return rid
+
+    async def _send_pump(self) -> None:
+        while True:
+            data, fut = await self._send_queue.get()
+            try:
+                await self.ws.send(json.dumps(data))
+                if fut and not fut.done():
+                    fut.set_result(True)
+            except Exception as exc:
+                if fut and not fut.done():
+                    fut.set_exception(exc)
+            finally:
+                self._send_queue.task_done()
+
+    async def _recv_pump(self) -> None:
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                headers = {
-                    "Authorization": f"Bearer {self.token}",
-                    "Deriv-App-ID": self.app_id,  # required by both endpoints per Deriv docs - was missing entirely
-                }
+            async for raw in self.ws:
                 try:
-                    accounts_resp = await client.get(f"{REST_BASE}/trading/v1/options/accounts", headers=headers)
-                except httpx.RequestError as e:
-                    # Could not even reach the REST host (DNS/network/timeout) -
-                    # this is the one case where falling back to legacy is a
-                    # reasonable guess rather than a hidden bug.
-                    print(f"WARNING: could not reach {REST_BASE} ({e!r}) - "
-                          f"falling back to legacy direct connect.")
-                    return f"{WS_BASE}?app_id={self.app_id}"
-
-                if accounts_resp.status_code == 404:
-                    # Could genuinely mean "no Options accounts for this token"
-                    # (real accounts, not enrolled in this product) - but could
-                    # also mean a bad app_id/path. Print it either way instead
-                    # of silently falling back, since that silence is exactly
-                    # what makes this hard to diagnose from logs alone.
-                    print(f"WARNING: GET {REST_BASE}/trading/v1/options/accounts returned 404 - "
-                          f"falling back to legacy direct connect. If legacy also fails, check "
-                          f"DERIV_APP_ID is a real registered app ID, not left as the default "
-                          f"test value.")
-                    return f"{WS_BASE}?app_id={self.app_id}"
-
-                if accounts_resp.status_code in (401, 403):
-                    raise RuntimeError(
-                        f"Deriv REST API rejected DERIV_TOKEN with HTTP {accounts_resp.status_code} "
-                        f"when fetching accounts. This means the token is invalid, expired, or lacks "
-                        f"the required scope - NOT that the account isn't migrated. Check DERIV_TOKEN "
-                        f"in Railway's Variables tab."
-                    )
-
-                accounts_resp.raise_for_status()  # any other non-2xx is a real, surfaced error
-                accounts_body = accounts_resp.json()
-                # Defensive: Deriv's OTP endpoint wraps its payload in a
-                # top-level "data" key, so the accounts list plausibly does
-                # too even though the docs page doesn't show a response
-                # example. Handle both shapes rather than assume either.
-                if "data" in accounts_body and isinstance(accounts_body["data"], dict):
-                    accounts = accounts_body["data"].get("accounts", [])
-                else:
-                    accounts = accounts_body.get("accounts", [])
-                if not accounts:
-                    return f"{WS_BASE}?app_id={self.app_id}"
-
-                account = self._select_account(accounts)
-                if account is None:
-                    if self.forced_account_id:
-                        raise RuntimeError(
-                            f"DERIV_ACCOUNT_ID={self.forced_account_id} was not found among "
-                            f"{len(accounts)} account(s) returned by Deriv for this token."
-                        )
-                    kind = "demo/virtual" if self.want_virtual else "real-money"
-                    raise RuntimeError(
-                        f"No {kind} account found for this token among {len(accounts)} "
-                        f"account(s) returned by Deriv. Refusing to guess - check DERIV_TOKEN "
-                        f"and your account setup on Deriv, or set DERIV_ACCOUNT_ID explicitly."
-                    )
-                self.resolved_account = account
-                account_id = account["id"]
-                print(f"Resolved Deriv account: id={account_id} "
-                      f"currency={account.get('currency', '?')} "
-                      f"virtual={self._is_virtual(account)}")
-
-                otp_resp = await client.post(
-                    f"{REST_BASE}/trading/v1/options/accounts/{account_id}/otp", headers=headers
-                )
-                if otp_resp.status_code in (401, 403):
-                    raise RuntimeError(
-                        f"Deriv REST API rejected the OTP request with HTTP {otp_resp.status_code} "
-                        f"for account {account_id}. Check DERIV_TOKEN has permission for this account."
-                    )
-                otp_resp.raise_for_status()
-                otp_body = otp_resp.json()
-                # Per Deriv docs the payload is nested: {"data": {"url": "wss://..."}}
-                # - not a flat "websocket_url" key. Handle both defensively in
-                # case the API returns either shape.
-                if "data" in otp_body and isinstance(otp_body["data"], dict) and "url" in otp_body["data"]:
-                    return otp_body["data"]["url"]
-                if "websocket_url" in otp_body:
-                    return otp_body["websocket_url"]
-                raise RuntimeError(
-                    f"OTP response didn't contain a recognizable URL field. "
-                    f"Response keys: {list(otp_body.keys())}"
-                )
-        except RuntimeError:
-            raise  # our own diagnosed errors - never swallow these into a silent fallback
-
-    async def _recv_loop(self) -> None:
-        try:
-            async for raw in self._ws:
-                msg = json.loads(raw)
-                req_id = msg.get("req_id")
-                if req_id is not None and req_id in self._pending:
-                    fut = self._pending.pop(req_id)
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                rid = msg.get("req_id")
+                if rid and rid in self._pending_requests:
+                    fut = self._pending_requests.pop(rid)
                     if not fut.done():
                         fut.set_result(msg)
-                msg_type = msg.get("msg_type")
-                for cb in self._subscribers.get(msg_type, []):
-                    asyncio.create_task(cb(msg))
-        except websockets.ConnectionClosed:
-            pass
+                else:
+                    await self._inbox.put(msg)
+        except (ConnectionClosed, ConnectionClosedError, ConnectionClosedOK):
+            for fut in self._pending_requests.values():
+                if not fut.done():
+                    fut.cancel()
+            self._pending_requests.clear()
+            await self._inbox.put({"__disconnect__": True})
+        except Exception as exc:
+            print(f"RECV error: {exc}")
+            for fut in self._pending_requests.values():
+                if not fut.done():
+                    fut.cancel()
+            self._pending_requests.clear()
+            await self._inbox.put({"__disconnect__": True})
 
-    async def _send(self, payload: Dict[str, Any], expect_response: bool = True) -> Optional[Dict[str, Any]]:
-        req_id = next(self._req_id_counter)
-        payload = {**payload, "req_id": req_id}
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        if expect_response:
-            self._pending[req_id] = fut
-        await self._ws.send(json.dumps(payload))
-        if expect_response:
-            return await asyncio.wait_for(fut, timeout=15)
+    # ---- Send / receive ----
+
+    async def send(self, data: dict) -> None:
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+        await self._send_queue.put((data, fut))
+        await fut
+
+    async def send_with_id(self, data: dict, timeout: float = 12) -> Optional[dict]:
+        """Sends with a unique req_id and awaits the matching response via
+        a Future - safe alongside a continuous tick stream, since the
+        reply is routed by req_id instead of 'whatever's next in the
+        inbox' (which a concurrent tick could easily beat it to)."""
+        loop = asyncio.get_event_loop()
+        rid = self._next_req_id()
+        fut = loop.create_future()
+        self._pending_requests[rid] = fut
+        data = dict(data)
+        data["req_id"] = rid
+        await self.send(data)
+        try:
+            return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending_requests.pop(rid, None)
+            if not fut.done():
+                fut.cancel()
+            return None
+        except asyncio.CancelledError:
+            self._pending_requests.pop(rid, None)
+            return None
+
+    async def receive(self, timeout: float = 10) -> dict:
+        try:
+            return await asyncio.wait_for(self._inbox.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return {}
+
+    async def receive_type(self, msg_type: str, timeout: float = 10) -> Optional[dict]:
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                return None
+            try:
+                msg = await asyncio.wait_for(self._inbox.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return None
+            if "__disconnect__" in msg:
+                await self._inbox.put(msg)
+                return None
+            if msg_type in msg or "error" in msg:
+                return msg
+            await self._inbox.put(msg)
+
+    # ---- Trading calls used by main.py ----
+
+    async def subscribe_ticks(self, symbol: str) -> bool:
+        await self.send({"ticks": symbol, "subscribe": 1})
+        resp = await self.receive_type("tick", timeout=10)
+        if resp is None or "error" in resp:
+            err = (resp or {}).get("error", {}).get("message", "timeout")
+            print(f"Subscribe failed for {symbol}: {err}")
+            return False
+        return True
+
+    async def fetch_balance(self) -> Optional[float]:
+        try:
+            await self.send({"balance": 1})
+            resp = await self.receive_type("balance", timeout=10)
+            if resp and "balance" in resp:
+                return float(resp["balance"]["balance"])
+        except Exception as exc:
+            print(f"Balance fetch error: {exc}")
         return None
 
-    def subscribe(self, msg_type: str, callback) -> None:
-        self._subscribers.setdefault(msg_type, []).append(callback)
-
-    async def subscribe_ticks(self, symbol: str) -> None:
-        await self._send({"ticks": symbol, "subscribe": 1})
-
-    async def get_active_symbols(self) -> Dict[str, Any]:
-        return await self._send({"active_symbols": "brief"})
+    async def get_active_symbols(self) -> Optional[dict]:
+        return await self.send_with_id({"active_symbols": "brief"})
 
     async def get_proposal(self, contract_type: str, symbol: str, amount: float, duration: int,
-                            duration_unit: str, currency: str = "USD") -> Dict[str, Any]:
-        return await self._send({
+                            duration_unit: str, currency: str = "USD") -> Optional[dict]:
+        return await self.send_with_id({
             "proposal": 1,
             "amount": amount,
             "basis": "stake",
@@ -274,14 +291,20 @@ class DerivClient:
             "underlying_symbol": symbol,
         })
 
-    async def buy(self, proposal_id: str, price: float) -> Dict[str, Any]:
-        return await self._send({"buy": proposal_id, "price": price})
+    async def buy(self, proposal_id: str, price: float) -> Optional[dict]:
+        return await self.send_with_id({"buy": proposal_id, "price": price})
 
-    async def get_contract_status(self, contract_id: str) -> Dict[str, Any]:
-        return await self._send({"proposal_open_contract": 1, "contract_id": contract_id, "subscribe": 0})
+    async def get_contract_status(self, contract_id: str) -> Optional[dict]:
+        return await self.send_with_id({
+            "proposal_open_contract": 1, "contract_id": contract_id, "subscribe": 0
+        })
 
     async def close(self) -> None:
-        if self._recv_task:
-            self._recv_task.cancel()
-        if self._ws:
-            await self._ws.close()
+        for t in (self._send_task, self._recv_task):
+            if t and not t.done():
+                t.cancel()
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
