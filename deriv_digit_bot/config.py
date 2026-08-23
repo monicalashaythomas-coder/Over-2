@@ -39,7 +39,7 @@ def _b(name: str, default: bool) -> bool:
 class Config:
     # --- Deriv connection ---
     deriv_app_id: str = field(default_factory=lambda: _s("DERIV_APP_ID", "1089"))
-    deriv_token: str = field(default_factory=lambda: _s("DERIV_TOKEN", ""))
+    deriv_token: str = field(default_factory=lambda: _s("DERIV_TOKEN", "") or _s("DERIV_API_TOKEN", ""))
     deriv_account_id: str = field(default_factory=lambda: _s("DERIV_ACCOUNT_ID", ""))
 
     # --- Contract spec ---

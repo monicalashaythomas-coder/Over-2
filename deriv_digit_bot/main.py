@@ -96,9 +96,9 @@ async def run_live(cfg: Config) -> None:
     from data.storage import Storage
 
     print(f"Starting in MODE={cfg.mode}. This places {'REAL' if cfg.mode == 'LIVE' else 'PAPER'} trades.")
-    want_virtual = (cfg.mode == "DERIV_DEMO")  # LIVE requires a real-money account, DERIV_DEMO requires virtual
-    client = DerivClient(cfg.deriv_app_id, cfg.deriv_token, want_virtual=want_virtual,
-                          forced_account_id=cfg.deriv_account_id)
+    use_real_account = (cfg.mode == "LIVE")  # LIVE -> real-money account, DERIV_DEMO -> demo account
+    client = DerivClient(cfg.deriv_app_id, cfg.deriv_token, use_real_account=use_real_account,
+                          account_id=cfg.deriv_account_id or None)
     await client.connect()
 
     active_symbols = await client.get_active_symbols()
@@ -135,7 +135,8 @@ async def run_live(cfg: Config) -> None:
     signal_engine = SignalEngine(cfg, models, ensemble, calibrator)
     martingale = MartingaleState(cfg.base_stake, cfg.martingale_multiplier, cfg.max_martingale_steps,
                                   cfg.min_calibrated_probability)
-    risk = RiskState(starting_balance=1000.0, balance=1000.0, max_daily_loss=cfg.max_daily_loss,
+    risk = RiskState(starting_balance=client.initial_balance, balance=client.initial_balance,
+                      max_daily_loss=cfg.max_daily_loss,
                       max_drawdown=cfg.max_drawdown, max_consecutive_losses=cfg.max_consecutive_losses)
     storage = Storage()
 
@@ -156,27 +157,32 @@ async def run_live(cfg: Config) -> None:
     calibration_target_n = cfg.min_history_size * 3
     last_raw_prediction = None  # (raw_probability, model_outputs) awaiting next digit's outcome
 
-    tick_queue: asyncio.Queue = asyncio.Queue()
-
-    async def on_tick(msg):
-        tick = msg.get("tick")
-        if tick:
-            await tick_queue.put(tick)
-
-    client.subscribe("tick", on_tick)
-    await client.subscribe_ticks(cfg.symbol)
+    if not await client.subscribe_ticks(cfg.symbol):
+        raise RuntimeError(f"Failed to subscribe to {cfg.symbol} ticks - aborting.")
 
     print("Subscribed to ticks. Waiting for data...")
     try:
         while not shutdown_event.is_set():
-            get_tick = asyncio.ensure_future(tick_queue.get())
-            wait_shutdown = asyncio.ensure_future(shutdown_event.wait())
-            done, pending = await asyncio.wait({get_tick, wait_shutdown}, return_when=asyncio.FIRST_COMPLETED)
-            for p in pending:
-                p.cancel()
-            if wait_shutdown in done:
-                break
-            tick = get_tick.result()
+            response = await client.receive(timeout=5)
+            if not response:
+                continue  # nothing arrived within 5s - loop back to recheck shutdown_event
+
+            if "__disconnect__" in response:
+                print("Disconnected - attempting to reconnect...")
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                await client.connect()
+                if not await client.subscribe_ticks(cfg.symbol):
+                    raise RuntimeError(f"Reconnected but failed to resubscribe to {cfg.symbol}.")
+                print("Reconnected and resubscribed.")
+                continue
+
+            if "tick" not in response:
+                continue
+
+            tick = response["tick"]
             quote = float(tick["quote"])
             digit = extract_last_digit(quote, decimals)
             storage.insert_tick(time.time(), cfg.symbol, quote, digit)
