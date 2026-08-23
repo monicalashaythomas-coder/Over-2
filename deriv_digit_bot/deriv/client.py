@@ -60,9 +60,23 @@ class DerivClient:
 
     async def connect(self) -> None:
         url = await self._resolve_ws_url()
-        self._ws = await websockets.connect(url, ping_interval=20, ping_timeout=10)
+        is_legacy = "authorize" not in url  # OTP URLs embed the auth; legacy doesn't
+        try:
+            self._ws = await websockets.connect(url, ping_interval=20, ping_timeout=10)
+        except websockets.InvalidStatus as e:
+            if is_legacy and getattr(e.response, "status_code", None) == 401:
+                raise RuntimeError(
+                    "Legacy WebSocket connect was rejected with HTTP 401. This specific "
+                    "combination (legacy URL + 401 at handshake) means your account has "
+                    "been migrated to Deriv's Options API and no longer accepts direct "
+                    "connects - it needs the OTP bootstrap. If you're seeing this, the "
+                    "OTP flow in _resolve_ws_url() fell back to legacy - check the WARNING "
+                    "printed just before this error for why, or verify DERIV_TOKEN/"
+                    "DERIV_APP_ID are set correctly in Railway."
+                ) from e
+            raise
         self._recv_task = asyncio.create_task(self._recv_loop())
-        if "authorize" not in url:
+        if is_legacy:
             # Legacy fallback path still needs an explicit authorize call
             await self._send({"authorize": self.token})
 
@@ -108,15 +122,43 @@ class DerivClient:
         return None
 
     async def _resolve_ws_url(self) -> str:
-        if httpx is None or not self.token:
+        if not self.token:
+            raise RuntimeError("DERIV_TOKEN is empty - cannot authenticate. Check the Railway variable is set.")
+
+        if httpx is None:
+            print("WARNING: httpx not installed - cannot use the Options API OTP bootstrap, "
+                  "falling back to legacy direct connect. This WILL 401 if your account has "
+                  "been migrated to the new Options API. Check requirements.txt was actually "
+                  "installed (see Build Logs for a 'pip install' step that completed).")
             return f"{WS_BASE}?app_id={self.app_id}"
+
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 headers = {"Authorization": f"Bearer {self.token}"}
-                accounts_resp = await client.get(f"{REST_BASE}/trading/v1/options/accounts", headers=headers)
-                if accounts_resp.status_code == 404:
+                try:
+                    accounts_resp = await client.get(f"{REST_BASE}/trading/v1/options/accounts", headers=headers)
+                except httpx.RequestError as e:
+                    # Could not even reach the REST host (DNS/network/timeout) -
+                    # this is the one case where falling back to legacy is a
+                    # reasonable guess rather than a hidden bug.
+                    print(f"WARNING: could not reach {REST_BASE} ({e!r}) - "
+                          f"falling back to legacy direct connect.")
                     return f"{WS_BASE}?app_id={self.app_id}"
-                accounts_resp.raise_for_status()
+
+                if accounts_resp.status_code == 404:
+                    # This specific status means the Options API doesn't know
+                    # this token at all - genuinely not-yet-migrated, legacy is correct.
+                    return f"{WS_BASE}?app_id={self.app_id}"
+
+                if accounts_resp.status_code in (401, 403):
+                    raise RuntimeError(
+                        f"Deriv REST API rejected DERIV_TOKEN with HTTP {accounts_resp.status_code} "
+                        f"when fetching accounts. This means the token is invalid, expired, or lacks "
+                        f"the required scope - NOT that the account isn't migrated. Check DERIV_TOKEN "
+                        f"in Railway's Variables tab."
+                    )
+
+                accounts_resp.raise_for_status()  # any other non-2xx is a real, surfaced error
                 accounts = accounts_resp.json().get("accounts", [])
                 if not accounts:
                     return f"{WS_BASE}?app_id={self.app_id}"
@@ -143,15 +185,15 @@ class DerivClient:
                 otp_resp = await client.post(
                     f"{REST_BASE}/trading/v1/options/accounts/{account_id}/otp", headers=headers
                 )
+                if otp_resp.status_code in (401, 403):
+                    raise RuntimeError(
+                        f"Deriv REST API rejected the OTP request with HTTP {otp_resp.status_code} "
+                        f"for account {account_id}. Check DERIV_TOKEN has permission for this account."
+                    )
                 otp_resp.raise_for_status()
                 return otp_resp.json()["websocket_url"]
         except RuntimeError:
-            raise  # account-mismatch is a real error - never swallow it into a silent fallback
-        except Exception:
-            # Any OTHER failure in the new-API bootstrap (network hiccup,
-            # endpoint not migrated yet, etc.) falls back to the legacy
-            # direct-connect path rather than crashing startup.
-            return f"{WS_BASE}?app_id={self.app_id}"
+            raise  # our own diagnosed errors - never swallow these into a silent fallback
 
     async def _recv_loop(self) -> None:
         try:
